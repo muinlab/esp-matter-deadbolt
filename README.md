@@ -154,6 +154,13 @@ chip-tool any write-by-id 0x131BFC00 0 57005 <node_id> 1
 | `factory_reset` | `0x00000000` | uint16 | `57005`(0xDEAD) 쓰기 → 팩토리 리셋 |
 | `exit_open` | `0x00000001` | uint8 | duration(3~30) 쓰기 → 퇴실 열림 후 자동 잠금 |
 | `ota_trigger` | `0x00000002` | uint8 | `1` 쓰기 → GitHub Releases latest OTA |
+| `health` | `0x00000003` | uint32 | `1` 쓰기 → 기존 헬스체크 비트맵 갱신 |
+
+장애 원인 수집용 읽기 전용 HTTP 스냅샷은
+`GET http://<deadbolt-ip>/diag`에서 확인할 수 있습니다 (`/diagnostics`도 지원). 기존 Matter
+속성 계약은 변경하지 않으며, 필드와 판정 기준은
+[`docs/RCA_DIAGNOSTICS.md`](docs/RCA_DIAGNOSTICS.md)를 참고하세요.
+카나리 설치 여부는 `/diag`의 `diagnosticsRevision`과 `firmwareBuildId`로 확인합니다.
 
 전체 API 명세: [`docs/API_SPECIFICATION.md`](docs/API_SPECIFICATION.md)
 
@@ -162,6 +169,7 @@ chip-tool any write-by-id 0x131BFC00 0 57005 <node_id> 1
 ```
 main/
 ├── app_main.cpp        # Matter 노드 초기화, 이벤트 콜백, BOOT 버튼 태스크
+├── diagnostics.cpp     # RCA 카운터, 최근 명령 단계, 리셋/WiFi 상태
 ├── door_controller.cpp # 명령 큐, 릴레이 상태, 자동 잠금 타이머
 ├── hal_gpio.cpp        # GPIO 릴레이 추상화
 ├── comm_layer.cpp      # Matter 연결 상태 관리

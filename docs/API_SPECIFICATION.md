@@ -265,6 +265,22 @@ rssi    = ((val >> 16) & 0xFF) - 128  # dBm, 미연결=-128
 > [!NOTE]
 > 쓰기 직후 읽기가 이루어지면 측정이 완료되기 전일 수 있습니다. 100ms 이상 후 읽기를 권장합니다.
 
+#### 장애 분석 스냅샷 (로컬 HTTP)
+
+기존 Matter `health` 비트맵을 변경하지 않고 더 상세한 장애 경계를 조회할 수
+있습니다.
+
+```bash
+curl --fail --max-time 2 http://<deadbolt-ip>/diag
+```
+
+응답에는 `diagnosticsRevision`, 실행 ELF의 `firmwareBuildId` SHA-256, 리셋 사유,
+uptime, 현재/최소 힙, WiFi 단절·재연결 횟수,
+Matter 명령 콜백 횟수와 최근 8개 명령의 수신·큐·실행·릴레이 명령·완료
+시각이 포함됩니다. 모든 시각은 부팅 후 경과 밀리초이며 재부팅 시 기록이
+초기화됩니다. 상세 스키마와 판정표는
+[`RCA_DIAGNOSTICS.md`](RCA_DIAGNOSTICS.md)를 참고하세요.
+
 ---
 
 ## 3. 커미셔닝 (기기 등록)

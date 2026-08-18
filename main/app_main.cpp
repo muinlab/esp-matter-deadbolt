@@ -2,6 +2,7 @@
 #include "door_controller.h"
 #include "comm_layer.h"
 #include "status_led.h"
+#include "diagnostics.h"
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -13,7 +14,10 @@
 #include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -27,6 +31,10 @@ using namespace esp_matter::attribute;
 using namespace chip::app::Clusters;
 using namespace chip::app::Clusters::DoorLock;
 
+#if CONFIG_APP_RETRIEVE_LEN_ELF_SHA != 64
+#error "RCA diagnostics require the full 64-character ELF SHA-256"
+#endif
+
 static const char *TAG = "app_main";
 
 /* door_control_task는 더 이상 사용하지 않음 — door_queue_command() 사용 */
@@ -38,6 +46,9 @@ static const uint32_t CUSTOM_ATTR_EXIT_OPEN        = 0x00000001;  // uint8, writ
 static const uint32_t CUSTOM_ATTR_OTA_TRIGGER      = 0x00000002;  // uint8, write 1 → HTTPS OTA 시작
 static const uint32_t CUSTOM_ATTR_HEALTH           = 0x00000003;  // uint32, write 1 → 헬스체크, read → 결과
 static const uint16_t FACTORY_RESET_MAGIC          = 0xDEAD;
+
+#define FIRMWARE_VERSION            "v1.1.5"
+#define DIAGNOSTICS_REVISION        "edge76-rca1"
 
 // GitHub Releases latest 고정 URL — 버전 업 시 URL 변경 불필요
 #define OTA_FIRMWARE_URL \
@@ -189,12 +200,135 @@ static esp_err_t log_handler_json(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t diagnostics_handler_json(httpd_req_t *req)
+{
+    diagnostics_snapshot_t snapshot = {};
+    diagnostics_get_snapshot(&snapshot);
+
+    const uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000LL);
+    const uint32_t free_heap = esp_get_free_heap_size();
+    const uint32_t minimum_free_heap = esp_get_minimum_free_heap_size();
+    char firmware_build_id[65] = {};
+    if (esp_app_get_elf_sha256(firmware_build_id, sizeof(firmware_build_id)) !=
+        (int)sizeof(firmware_build_id)) {
+        snprintf(firmware_build_id, sizeof(firmware_build_id), "unavailable");
+    }
+    wifi_ap_record_t ap_info = {};
+    const bool wifi_driver_connected = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+    const int wifi_rssi = wifi_driver_connected ? (int)ap_info.rssi : -128;
+    const unsigned int wifi_channel = wifi_driver_connected ? (unsigned int)ap_info.primary : 0;
+
+    esp_err_t response_err = httpd_resp_set_type(req, "application/json");
+    if (response_err != ESP_OK) return response_err;
+    response_err = httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (response_err != ESP_OK) return response_err;
+    response_err = httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (response_err != ESP_OK) return response_err;
+
+    char chunk[1400];
+    int length = snprintf(
+        chunk, sizeof(chunk),
+        "{\"schemaVersion\":1,\"firmwareVersion\":\"%s\","
+        "\"diagnosticsRevision\":\"%s\",\"firmwareBuildId\":\"%s\","
+        "\"autoOtaEnabled\":true,\"autoOtaChannel\":\"github-latest\",\"uptimeMs\":%llu,"
+        "\"reset\":{\"code\":%d,\"reason\":\"%s\"},"
+        "\"heap\":{\"freeBytes\":%lu,\"minimumFreeBytes\":%lu},"
+        "\"wifi\":{\"eventConnected\":%s,\"driverConnected\":%s,"
+        "\"rssiDbm\":%d,\"channel\":%u,\"connectionCount\":%lu,"
+        "\"disconnectCount\":%lu,\"reconnectCount\":%lu,"
+        "\"lastDisconnectReason\":%u,\"lastDisconnectRssiDbm\":%d,"
+        "\"lastDisconnectUptimeMs\":%llu,\"lastReconnectUptimeMs\":%llu},"
+        "\"matter\":{\"serverReady\":%s,\"serverReadyUptimeMs\":%llu,"
+        "\"applicationCommandCallbackCount\":%lu,\"healthRequestCount\":%lu,"
+        "\"lastHealthRequestUptimeMs\":%llu},"
+        "\"command\":{\"receivedCount\":%lu,\"completedCount\":%lu,"
+        "\"busyCount\":%lu,\"queueOverwriteObservedCount\":%lu,"
+        "\"historyCapacity\":%u,\"physicalBoltVerificationAvailable\":false,\"recent\":[",
+        FIRMWARE_VERSION,
+        DIAGNOSTICS_REVISION,
+        firmware_build_id,
+        (unsigned long long)now_ms,
+        (int)snapshot.reset_reason,
+        diagnostics_reset_reason_name(snapshot.reset_reason),
+        (unsigned long)free_heap,
+        (unsigned long)minimum_free_heap,
+        snapshot.wifi_connected ? "true" : "false",
+        wifi_driver_connected ? "true" : "false",
+        wifi_rssi,
+        wifi_channel,
+        (unsigned long)snapshot.wifi_connection_count,
+        (unsigned long)snapshot.wifi_disconnect_count,
+        (unsigned long)snapshot.wifi_reconnect_count,
+        (unsigned int)snapshot.last_wifi_disconnect_reason,
+        (int)snapshot.last_wifi_disconnect_rssi,
+        (unsigned long long)snapshot.last_wifi_disconnect_uptime_ms,
+        (unsigned long long)snapshot.last_wifi_reconnect_uptime_ms,
+        snapshot.matter_server_ready ? "true" : "false",
+        (unsigned long long)snapshot.matter_server_ready_uptime_ms,
+        (unsigned long)snapshot.matter_application_command_callback_count,
+        (unsigned long)snapshot.health_request_count,
+        (unsigned long long)snapshot.last_health_request_uptime_ms,
+        (unsigned long)snapshot.command_received_count,
+        (unsigned long)snapshot.command_completed_count,
+        (unsigned long)snapshot.command_busy_count,
+        (unsigned long)snapshot.command_queue_overwrite_count,
+        (unsigned int)DIAGNOSTICS_COMMAND_HISTORY_SIZE);
+
+    if (length < 0 || (size_t)length >= sizeof(chunk)) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   "diagnostics serialization failed");
+    }
+    response_err = httpd_resp_send_chunk(req, chunk, length);
+    if (response_err != ESP_OK) return response_err;
+
+    for (uint8_t i = 0; i < snapshot.command_history_count; ++i) {
+        const diagnostics_command_record_t &record = snapshot.commands[i];
+        uint64_t handler_duration_ms = 0;
+        if (record.completed_uptime_ms >= record.started_uptime_ms &&
+            record.started_uptime_ms > 0) {
+            handler_duration_ms = record.completed_uptime_ms - record.started_uptime_ms;
+        }
+
+        length = snprintf(
+            chunk, sizeof(chunk),
+            "%s{\"sequence\":%lu,\"type\":\"%s\",\"origin\":\"%s\","
+            "\"target\":\"%s\",\"stage\":\"%s\",\"result\":\"%s\","
+            "\"receivedUptimeMs\":%llu,\"queuedUptimeMs\":%llu,"
+            "\"startedUptimeMs\":%llu,\"relayCommandedUptimeMs\":%llu,"
+            "\"completedUptimeMs\":%llu,\"handlerDurationMs\":%llu}",
+            i == 0 ? "" : ",",
+            (unsigned long)record.sequence,
+            diagnostics_command_type_name(record.type),
+            diagnostics_command_origin_name(record.origin),
+            record.target_unlock ? "unlocked" : "locked",
+            diagnostics_command_stage_name(record.stage),
+            diagnostics_command_result_name(record.result),
+            (unsigned long long)record.received_uptime_ms,
+            (unsigned long long)record.queued_uptime_ms,
+            (unsigned long long)record.started_uptime_ms,
+            (unsigned long long)record.relay_commanded_uptime_ms,
+            (unsigned long long)record.completed_uptime_ms,
+            (unsigned long long)handler_duration_ms);
+        if (length < 0 || (size_t)length >= sizeof(chunk)) {
+            httpd_resp_sendstr_chunk(req, nullptr);
+            return ESP_FAIL;
+        }
+        response_err = httpd_resp_send_chunk(req, chunk, length);
+        if (response_err != ESP_OK) return response_err;
+    }
+
+    response_err = httpd_resp_sendstr_chunk(req, "]}}");
+    if (response_err != ESP_OK) return response_err;
+    return httpd_resp_sendstr_chunk(req, nullptr);
+}
+
 static void start_log_httpd(void)
 {
     if (s_log_httpd) return;  // 이미 실행 중
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
+    cfg.stack_size       = 6144;
     cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
 
@@ -213,8 +347,24 @@ static void start_log_httpd(void)
         .method  = HTTP_GET,
         .handler = log_handler_json,
     };
-    httpd_register_uri_handler(s_log_httpd, &uri_root);
-    httpd_register_uri_handler(s_log_httpd, &uri_logs);
+    static const httpd_uri_t uri_diagnostics = {
+        .uri     = "/diagnostics",
+        .method  = HTTP_GET,
+        .handler = diagnostics_handler_json,
+    };
+    static const httpd_uri_t uri_diag = {
+        .uri     = "/diag",
+        .method  = HTTP_GET,
+        .handler = diagnostics_handler_json,
+    };
+    const httpd_uri_t *uris[] = { &uri_root, &uri_logs, &uri_diag, &uri_diagnostics };
+    for (const httpd_uri_t *uri : uris) {
+        esp_err_t register_err = httpd_register_uri_handler(s_log_httpd, uri);
+        if (register_err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP URI 등록 실패: uri=%s error=%s",
+                     uri->uri, esp_err_to_name(register_err));
+        }
+    }
 
     /* 자신의 IP 주소 로그 출력 */
     esp_netif_ip_info_t ip_info = {};
@@ -228,7 +378,6 @@ static void start_log_httpd(void)
 
 static uint16_t s_door_endpoint_id = 1;
 
-#define FIRMWARE_VERSION            "v1.1.5"
 #define GITHUB_API_LATEST_URL       "https://api.github.com/repos/muinlab/esp-matter-deadbolt/releases/latest"
 #define AUTO_OTA_BOOT_DELAY_MS      (15UL * 1000UL)          // 부팅 후 첫 확인 전 대기
 #define AUTO_OTA_CHECK_INTERVAL_MS  (1UL * 3600UL * 1000UL)  // 1시간마다 재확인
@@ -537,6 +686,7 @@ static esp_err_t app_attribute_update_cb(
             ESP_LOGI(TAG, "OTA 트리거 수신");
             xTaskCreate(ota_task, "ota_task", 8192, nullptr, 5, nullptr);
         } else if (attribute_id == CUSTOM_ATTR_HEALTH && val->val.u32 == 1) {
+            diagnostics_note_health_request();
             xTaskCreate(health_check_task, "health_chk", 4096, nullptr, 3, nullptr);
         }
         return ESP_OK;
@@ -568,6 +718,17 @@ static void refresh_commissioning_led(void)
     ESP_LOGI(TAG, "LED 커미셔닝 상태: fabric=%d window=%d", has_fabric, window_open);
 }
 
+static void wifi_diagnostics_event_handler(void *arg, esp_event_base_t event_base,
+                                           int32_t event_id, void *event_data)
+{
+    if (event_base != WIFI_EVENT || event_id != WIFI_EVENT_STA_DISCONNECTED) return;
+
+    const wifi_event_sta_disconnected_t *event =
+        static_cast<const wifi_event_sta_disconnected_t *>(event_data);
+    diagnostics_note_wifi_disconnected(event ? event->reason : 0,
+                                       event ? event->rssi : -128);
+}
+
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
     switch (event->Type) {
@@ -580,6 +741,7 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         case chip::DeviceLayer::DeviceEventType::kInterfaceIpAddressChanged:
             if (event->InterfaceIpAddressChanged.Type ==
                 chip::DeviceLayer::InterfaceIpChangeType::kIpV4_Assigned) {
+                diagnostics_note_wifi_connected();
                 {
                     esp_netif_ip_info_t ip_info = {};
                     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -605,6 +767,8 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         case chip::DeviceLayer::DeviceEventType::kWiFiConnectivityChange:
             if (event->WiFiConnectivityChange.Result ==
                 chip::DeviceLayer::ConnectivityChange::kConnectivity_Lost) {
+                /* 원시 WiFi 콜백과 중복되어도 diagnostics가 한 단절 구간으로 합친다. */
+                diagnostics_note_wifi_disconnected(0, -128);
                 ESP_LOGW(TAG, "WiFi 연결 끊김 → Matter 비활성");
                 comm_set_matter_connected(false);
             }
@@ -627,6 +791,7 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
             break;
 
         case chip::DeviceLayer::DeviceEventType::kServerReady:
+            diagnostics_note_matter_server_ready();
             refresh_commissioning_led();
             break;
 
@@ -754,16 +919,18 @@ static void factory_reset_task(void *arg)
 
 extern "C" void app_main(void)
 {
-    ESP_LOGI(TAG, "=== ESP32-S3 Matter Door Lock 시작 ===");
-    esp_log_set_vprintf(deadbolt_vprintf);
-
-    // 0. 최우선: 릴레이 GPIO 즉시 HIGH (Low Trigger → 릴레이 OFF → 잠금)
+    // 0. 최우선: 릴레이 GPIO 즉시 LOW (잠금 상태)
     gpio_reset_pin((gpio_num_t)GPIO_RELAY_PIN);
     gpio_set_direction((gpio_num_t)GPIO_RELAY_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level((gpio_num_t)GPIO_RELAY_PIN, 0);  // LOW = 잠금
 
     // 0-1. GPIO 전체 초기화
     gpio_init();
+
+    // 안전 GPIO 설정 이후에만 로그/진단 초기화
+    esp_log_set_vprintf(deadbolt_vprintf);
+    diagnostics_init(esp_reset_reason());
+    ESP_LOGI(TAG, "=== ESP32-S3 Matter Door Lock 시작 ===");
 
     // 1. NVS 초기화
     esp_err_t err = nvs_flash_init();
@@ -794,6 +961,12 @@ extern "C" void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Matter 시작 실패: %s", esp_err_to_name(err));
         return;
+    }
+
+    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
+                                     wifi_diagnostics_event_handler, nullptr);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 진단 이벤트 등록 실패: %s", esp_err_to_name(err));
     }
 
     // 7. (BLE GATT 제거 — Matter 커미셔닝 전용)

@@ -1,6 +1,9 @@
 # Flash
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
+# Full ELF identity for /diag canary verification
+CONFIG_APP_RETRIEVE_LEN_ELF_SHA=64
+
 # BLE
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y

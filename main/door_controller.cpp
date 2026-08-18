@@ -2,6 +2,7 @@
 #include "hal_gpio.h"
 #include "comm_layer.h"
 #include "status_led.h"
+#include "diagnostics.h"
 
 #include "esp_log.h"
 #include "esp_check.h"
@@ -18,12 +19,19 @@ static SemaphoreHandle_t s_door_mutex = NULL;
 static esp_timer_handle_t s_exit_timer = NULL;
 
 /* ── Command Queue ── */
-typedef struct { bool target_unlock; } door_cmd_t;
+typedef struct {
+    bool target_unlock;
+    uint32_t sequence;
+} door_cmd_t;
 static QueueHandle_t s_cmd_queue = NULL;
 static TaskHandle_t  s_worker_task = NULL;
 
 /* ── Forward ── */
 static void exit_timer_cb(void *arg);
+static op_result_t door_execute_tracked(bool target_unlock,
+                                        diagnostics_command_type_t type,
+                                        diagnostics_command_origin_t origin,
+                                        uint32_t sequence);
 
 /* ═══════════════════════════════════════════════════════════
  *  도어 제어
@@ -31,10 +39,19 @@ static void exit_timer_cb(void *arg);
  *  잠금: GPIO LOW → 릴레이 OFF
  * ═══════════════════════════════════════════════════════════ */
 
-op_result_t door_execute(bool target_unlock)
+static op_result_t door_execute_tracked(bool target_unlock,
+                                        diagnostics_command_type_t type,
+                                        diagnostics_command_origin_t origin,
+                                        uint32_t sequence)
 {
+    if (sequence == 0) {
+        sequence = diagnostics_note_command_received(type, origin, target_unlock);
+    }
+    diagnostics_note_command_started(sequence);
+
     if (xSemaphoreTakeRecursive(s_door_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
         ESP_LOGW(TAG, "동작 진행 중 → 명령 거부");
+        diagnostics_note_command_completed(sequence, DIAG_RESULT_BUSY);
         return OP_RESULT_FAIL_BUSY;
     }
 
@@ -42,6 +59,7 @@ op_result_t door_execute(bool target_unlock)
         status_led_notify_unlocking();
         deadbolt_unlock();
         g_lock_state = false;
+        diagnostics_note_relay_commanded(sequence);
         report_result(OP_RESULT_SUCCESS, 1);
         status_led_set_locked(false);
         ESP_LOGI(TAG, "해제 완료");
@@ -49,13 +67,23 @@ op_result_t door_execute(bool target_unlock)
         status_led_notify_locking();
         deadbolt_lock();
         g_lock_state = true;
+        diagnostics_note_relay_commanded(sequence);
         report_result(OP_RESULT_SUCCESS, 1);
         status_led_set_locked(true);
         ESP_LOGI(TAG, "잠금 완료");
     }
 
     xSemaphoreGiveRecursive(s_door_mutex);
+    diagnostics_note_command_completed(sequence, DIAG_RESULT_SUCCESS);
     return OP_RESULT_SUCCESS;
+}
+
+op_result_t door_execute(bool target_unlock)
+{
+    return door_execute_tracked(target_unlock,
+                                target_unlock ? DIAG_COMMAND_UNLOCK : DIAG_COMMAND_LOCK,
+                                DIAG_COMMAND_ORIGIN_INTERNAL,
+                                0);
 }
 
 /* ── 퇴실 기능 ── */
@@ -63,7 +91,7 @@ op_result_t door_execute(bool target_unlock)
 static void exit_lock_task(void *arg)
 {
     ESP_LOGI(TAG, "퇴실 시간 만료 → 자동 잠금");
-    door_execute(false);
+    door_execute_tracked(false, DIAG_COMMAND_AUTO_LOCK, DIAG_COMMAND_ORIGIN_TIMER, 0);
     vTaskDelete(NULL);
 }
 
@@ -77,7 +105,10 @@ esp_err_t door_exit_open(uint8_t duration_sec)
     if (duration_sec < EXIT_MIN_SEC || duration_sec > EXIT_MAX_SEC)
         duration_sec = DEFAULT_EXIT_DURATION_SEC;
 
-    op_result_t result = door_execute(true);
+    uint32_t sequence = diagnostics_note_command_received(
+        DIAG_COMMAND_EXIT_OPEN, DIAG_COMMAND_ORIGIN_MATTER, true);
+    op_result_t result = door_execute_tracked(true, DIAG_COMMAND_EXIT_OPEN,
+                                              DIAG_COMMAND_ORIGIN_MATTER, sequence);
     if (result != OP_RESULT_SUCCESS)
         return ESP_FAIL;
 
@@ -95,17 +126,33 @@ static void door_worker_task(void *arg)
     while (true) {
         if (xQueueReceive(s_cmd_queue, &cmd, portMAX_DELAY) == pdTRUE) {
             ESP_LOGI(TAG, "큐 실행: %s", cmd.target_unlock ? "해제" : "잠금");
-            door_execute(cmd.target_unlock);
+            door_execute_tracked(cmd.target_unlock,
+                                 cmd.target_unlock ? DIAG_COMMAND_UNLOCK : DIAG_COMMAND_LOCK,
+                                 DIAG_COMMAND_ORIGIN_MATTER,
+                                 cmd.sequence);
         }
     }
 }
 
 void door_queue_command(bool target_unlock)
 {
-    door_cmd_t cmd = { .target_unlock = target_unlock };
+    uint32_t sequence = diagnostics_note_command_received(
+        target_unlock ? DIAG_COMMAND_UNLOCK : DIAG_COMMAND_LOCK,
+        DIAG_COMMAND_ORIGIN_MATTER,
+        target_unlock);
+    door_cmd_t cmd = { .target_unlock = target_unlock, .sequence = sequence };
+
     if (s_cmd_queue) {
+        /* 진단용 best-effort 관측이다. 원래 xQueueOverwrite 스케줄링은 변경하지 않는다. */
+        door_cmd_t previous = {};
+        if (xQueuePeek(s_cmd_queue, &previous, 0) == pdTRUE) {
+            diagnostics_note_queue_overwrite_observed(previous.sequence);
+        }
         xQueueOverwrite(s_cmd_queue, &cmd);
+        diagnostics_note_command_queued(sequence);
         ESP_LOGI(TAG, "큐 등록: %s", target_unlock ? "해제" : "잠금");
+    } else {
+        diagnostics_note_queue_unavailable(sequence);
     }
 }
 

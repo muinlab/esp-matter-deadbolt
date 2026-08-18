@@ -3,6 +3,7 @@ set(PRIV_REQUIRES_LIST
     driver
     esp_timer
     esp_event
+    esp_app_format
     bt
     esp_matter
     chip
@@ -18,6 +19,7 @@ set(PRIV_REQUIRES_LIST
 
 set(SRC_FILES
     app_main.cpp
+    diagnostics.cpp
     door_controller.cpp
     comm_layer.cpp
     hal_gpio.cpp

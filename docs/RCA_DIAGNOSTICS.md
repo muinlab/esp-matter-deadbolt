@@ -80,8 +80,15 @@ capture.
   the Matter OTA trigger, the auto-OTA latest URL, or a `flash_remote.sh` input
   downloaded from a release. Confirm `diagnosticsRevision` and save the exact
   `firmwareBuildId` before starting incident tests.
-- After canary approval, bump `FIRMWARE_VERSION`, the release tag, and the build
-  `diagnosticsRevision` together under the planned fleet rollout, then retain
+- Before connecting the flasher, place the independent SmartThings recovery
+  path for this site in an audited maintenance inhibit. This disables automatic
+  and remote power-cycle actions; it does **not** turn the entrance deadbolt
+  plug off. Verify that plug remains ON and that the Edge-PC plug is not part of
+  the operation. Keep the inhibit until `/diag`, Matter commissioning/health,
+  lock command, and an on-site physical-bolt check all pass. If any check fails,
+  leave automation inhibited and hand the incident to the on-site operator.
+- After canary approval, bump `FIRMWARE_VERSION` and `diagnosticsRevision`,
+  create the matching release tag under the planned fleet rollout, then retain
   and verify the newly generated `firmwareBuildId`.
 - Build with the project's exact ESP-IDF/ESP-Matter toolchain, then flash one
   canary device only. Verify fail-secure GPIO state at boot, `/diag` JSON, Wi-Fi
